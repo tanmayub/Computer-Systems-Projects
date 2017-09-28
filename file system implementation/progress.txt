@@ -1,0 +1,35 @@
+***************************************************************************************
+File Name     : progress.txt
+Team Number   : 3 
+Team Members  : Tanmay Budukh
+                Shailesh Pujari
+Course        : CS5600, Computer Systems
+Homework#     : 2
+***************************************************************************************
+
+***************************************************************************************
+Progress Report For Week of 21st November
+***************************************************************************************
+1. Read the homework2-docs.pdf and homework2.pdf to get a better 
+   understanding of the overall system. Also looked into the testing
+   docs in order to understand what is required as an output for a
+   particular functionality.
+   - Implemented the fs_init function, i.e. read superblock and allocated
+     memory for inode_map, bitmap and inodes and read the corresponding
+     blocks into these defined structures.
+   - Partially implemented the fs_readdir i.e. it reads the directory contents
+     of the root directory i.e. inodes[1]. We have a plan drafted to re 
+2. Currently, as we have finished with question 1 of hw1 we have a plan
+   drafted to read contents of a specified directory i.e. we have begun implementing
+   the fs_getattr on which reading contents of a specific directory is dependent upon.
+3. Also we have thought on how to list the statistics of the file i.e. cmd "ls -l"
+   using the linux stat command. 
+***************************************************************************************
+
+***************************************************************************************
+Progress Report For Week of 2nd December
+***************************************************************************************
+1. Implemented following functions-
+	- fs_mkdir, fs_rmdir, fs_utime, fs_chmod, fs_rename, fs_read.
+2. Will implement fs_write fort put functionality
+***************************************************************************************

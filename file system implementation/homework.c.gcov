@@ -1,0 +1,1108 @@
+        -:    0:Source:homework.c
+        -:    0:Graph:homework.gcno
+        -:    0:Data:homework.gcda
+        -:    0:Runs:22
+        -:    0:Programs:1
+        -:    1:/*
+        -:    2: * file:        homework.c
+        -:    3: * description: skeleton file for CS 5600/7600 file system
+        -:    4: *
+        -:    5: * CS 5600, Computer Systems, Northeastern CCIS
+        -:    6: * Peter Desnoyers, November 2016
+        -:    7: */
+        -:    8:
+        -:    9:#define FUSE_USE_VERSION 27
+        -:   10:
+        -:   11:#include <stdlib.h>
+        -:   12:#include <stddef.h>
+        -:   13:#include <unistd.h>
+        -:   14:#include <fuse.h>
+        -:   15:#include <fcntl.h>
+        -:   16:#include <string.h>
+        -:   17:#include <stdio.h>
+        -:   18:#include <errno.h>
+        -:   19:#include <time.h>
+        -:   20:
+        -:   21:#include "fsx600.h"
+        -:   22:#include "blkdev.h"
+        -:   23:
+        -:   24:#define DIRENTS_PER_BLOCK (FS_BLOCK_SIZE / sizeof(struct fs_dirent))
+        -:   25:#define DIRECT_BLOCKS 6
+        -:   26:#define INDIRECT_BLOCKS 256
+        -:   27:#define SUPER_BLK_SZ 1
+        -:   28:
+        -:   29:#define MIN(a, b) (a < b ? a : b) /* Macro defined to find the minimum */
+        -:   30:
+        -:   31:extern int homework_part;       /* set by '-part n' command-line option */
+        -:   32:
+        -:   33:/* 
+        -:   34: * disk access - the global variable 'disk' points to a blkdev
+        -:   35: * structure which has been initialized to access the image file.
+        -:   36: *
+        -:   37: * NOTE - blkdev access is in terms of 1024-byte blocks
+        -:   38: */
+        -:   39:extern struct blkdev *disk;
+        -:   40:
+        -:   41:/* by defining bitmaps as 'fd_set' pointers, you can use existing
+        -:   42: * macros to handle them. 
+        -:   43: *   FD_ISSET(##, inode_map);
+        -:   44: *   FD_CLR(##, block_map);
+        -:   45: *   FD_SET(##, block_map);
+        -:   46: */
+        -:   47:fd_set *inode_map;              /* = malloc(sb.inode_map_size * FS_BLOCK_SIZE); */
+        -:   48:fd_set *block_map;
+        -:   49:struct fs_inode *fs_inodes;
+        -:   50:struct fs_super super_blk;
+        -:   51:char *globalBuf;
+        -:   52:int blockForIndir1;
+        -:   53:
+        -:   54:static int removeDirOrFile(int, int, struct fs_dirent*, int, int);
+        -:   55:static int getInodeNum(char*, struct fs_dirent*, int*);
+        -:   56:static int handleDirentsBuffer(struct fs_dirent*, mode_t, char*, int, int);
+        -:   57:static void getBaseNameAndParent(const char*, char**, char**);
+        -:   58:
+        -:   59:
+        -:   60:/* init - this is called once by the FUSE framework at startup. Ignore
+        -:   61: * the 'conn' argument.
+        -:   62: * recommended actions:
+        -:   63: *   - read superblock
+        -:   64: *   - allocate memory, read bitmaps and inodes
+        -:   65: */
+       22:   66:void* fs_init(struct fuse_conn_info *conn)
+        -:   67:{
+        -:   68:	int blk_size;
+        -:   69:
+       22:   70:    disk->ops->read(disk, 0, 1, &super_blk);
+        -:   71:
+       22:   72:	blk_size = super_blk.num_blocks;
+        -:   73:
+       22:   74:	inode_map = (fd_set *)malloc(super_blk.inode_map_sz * blk_size);
+       22:   75:	disk->ops->read(disk, SUPER_BLK_SZ, super_blk.inode_map_sz, inode_map);
+        -:   76:
+       22:   77:	block_map = (fd_set *)malloc(super_blk.block_map_sz * blk_size);
+       22:   78:	disk->ops->read(disk, SUPER_BLK_SZ + super_blk.inode_map_sz, super_blk.block_map_sz, block_map);
+        -:   79:
+       22:   80:	fs_inodes = (struct fs_inode *)malloc(super_blk.inode_region_sz * blk_size);
+       22:   81:	disk->ops->read(disk, SUPER_BLK_SZ + super_blk.inode_map_sz + super_blk.block_map_sz, super_blk.inode_region_sz, fs_inodes);
+        -:   82:
+        -:   83:	//init globalBuf for write functionality
+       22:   84:	globalBuf = malloc(FS_BLOCK_SIZE);
+        -:   85:
+       22:   86:    return 0;
+        -:   87:}
+        -:   88:
+        -:   89:/* Note on path translation errors:
+        -:   90: * In addition to the method-specific errors listed below, almost
+        -:   91: * every method can return one of the following errors if it fails to
+        -:   92: * locate a file or directory corresponding to a specified path.
+        -:   93: *
+        -:   94: * ENOENT - a component of the path is not present.
+        -:   95: * ENOTDIR - an intermediate component of the path (e.g. 'b' in
+        -:   96: *           /a/b/c) is not a directory
+        -:   97: */
+        -:   98:
+        -:   99:/* note on splitting the 'path' variable:
+        -:  100: * the value passed in by the FUSE framework is declared as 'const',
+        -:  101: * which means you can't modify it. The standard mechanisms for
+        -:  102: * splitting strings in C (strtok, strsep) modify the string in place,
+        -:  103: * so you have to copy the string and then free the copy when you're
+        -:  104: * done. One way of doing this:
+        -:  105: *
+        -:  106: *    char *_path = strdup(path);
+        -:  107: *    int inum = translate(_path);
+        -:  108: *    free(_path);
+        -:  109: */
+        -:  110:
+    18517:  111:static int isValidToken(char *token, int inum) 
+        -:  112:{
+    18517:  113:	int inum_ret = 0;
+    18517:  114:	int i = 0;
+        -:  115:	struct fs_dirent *fs_dirents;
+    18517:  116:	if(S_ISDIR(fs_inodes[inum].mode)) {	
+        -:  117:		// allocate memory for fs_dirents
+    18517:  118:		fs_dirents = malloc(DIRENTS_PER_BLOCK * sizeof(struct fs_dirent));
+        -:  119:		// Load the dirents block for the given inode number i.e. read from disk
+    18517:  120:		if (disk->ops->read(disk, fs_inodes[inum].direct[0], 1, fs_dirents) >= 0)
+        -:  121:		{
+        -:  122:			// Iterate through the dirents buffer to get the relevant directory/file
+   576399:  123:			for(i = 0; i < DIRENTS_PER_BLOCK; i++) {
+   576370:  124:				if(fs_dirents[i].valid && strcmp(token, fs_dirents[i].name) == 0) {
+        -:  125:					// Return the corresponding inode number of the matched file/directory
+    18488:  126:					return fs_dirents[i].inode;					
+        -:  127:				}
+        -:  128:			}
+        -:  129:		}
+        -:  130:	}
+        -:  131:	// If no match is found then return ENOENT (No such file or directory)
+       29:  132:	return -ENOENT;
+        -:  133:}
+        -:  134:
+    18286:  135:static int translate(char *path) 
+        -:  136:{
+        -:  137:	char *token;
+    18286:  138:	char *duppath = strdup(path);
+    18286:  139:	const char delim[2] = "/";
+    18286:  140:	token = strtok(path, delim);
+    18286:  141:	int ct = 1;
+    55059:  142:	while(token != NULL) {
+    18517:  143:		ct = isValidToken(token, ct);
+    18517:  144:		token = strtok(NULL, delim);
+    18517:  145:		if(ct < 0) { //this will take care of dir/file not found
+       29:  146:			return ct;
+        -:  147:		}
+    18488:  148:		if(!S_ISDIR(fs_inodes[ct].mode)) { //this is for 'file/' or 'file/dir'
+    18170:  149:			if(token != NULL || duppath[strlen(duppath) - 1] == '/') {
+        1:  150:				return -ENOTDIR;
+        -:  151:			}
+        -:  152:		}
+        -:  153:	}
+    18256:  154:	return ct;
+        -:  155:}
+        -:  156:
+    18365:  157:static void fillStatStruc(struct stat *sb, int inum) {
+    18365:  158:	(*sb).st_ino = inum;
+    18365:  159:	(*sb).st_mode = fs_inodes[inum].mode;
+    18365:  160:	(*sb).st_uid = fs_inodes[inum].uid;
+    18365:  161:	(*sb).st_gid = fs_inodes[inum].gid;
+    18365:  162:	(*sb).st_size = fs_inodes[inum].size;
+    18365:  163:	(*sb).st_blksize = FS_BLOCK_SIZE;
+    18365:  164:	(*sb).st_blocks = S_ISDIR(fs_inodes[inum].mode) ? 1 : (fs_inodes[inum].size/FS_BLOCK_SIZE) + 1;
+    18365:  165:	(*sb).st_atime = fs_inodes[inum].mtime;
+    18365:  166:	(*sb).st_mtime = fs_inodes[inum].mtime;
+    18365:  167:	(*sb).st_ctime = fs_inodes[inum].ctime;
+    18365:  168:}
+        -:  169:
+        -:  170:/* getattr - get file or directory attributes. For a description of
+        -:  171: *  the fields in 'struct stat', see 'man lstat'.
+        -:  172: *
+        -:  173: * Note - fields not provided in fsx600 are:
+        -:  174: *    st_nlink - always set to 1
+        -:  175: *    st_atime, st_ctime - set to same value as st_mtime
+        -:  176: *
+        -:  177: * errors - path translation, ENOENT
+        -:  178: */
+    18286:  179:static int fs_getattr(const char *path, struct stat *sb)
+        -:  180:{	
+    18286:  181:	char *_path = strdup(path);
+    18286:  182:	int inum = translate(_path);
+    18286:  183:	if(inum >= 0) {
+    18256:  184:		fillStatStruc(sb, inum);
+    18256:  185:        	return 0;
+        -:  186:	}
+       30:  187:	free(_path);
+       30:  188:	return inum;
+        -:  189:}
+        -:  190:
+        -:  191:/* readdir - get directory contents.
+        -:  192: *
+        -:  193: * for each entry in the directory, invoke the 'filler' function,
+        -:  194: * which is passed as a function pointer, as follows:
+        -:  195: *     filler(buf, <name>, <statbuf>, 0)
+        -:  196: * where <statbuf> is a struct stat, just like in getattr.
+        -:  197: *
+        -:  198: * Errors - path resolution, ENOTDIR, ENOENT
+        -:  199: */
+       38:  200:static int fs_readdir(const char *path, void *ptr, fuse_fill_dir_t filler,
+        -:  201:		       off_t offset, struct fuse_file_info *fi)
+        -:  202:{
+        -:  203:	struct fs_dirent *fs_dirents;
+        -:  204:	struct stat sb;
+       38:  205:	int retval = fs_getattr(path, &sb);
+       38:  206:	if(retval < 0)
+        1:  207:		return retval;
+       37:  208:	if(S_ISDIR(fs_inodes[sb.st_ino].mode)) {
+        -:  209:
+       36:  210:		fs_dirents = malloc(DIRENTS_PER_BLOCK * sizeof(struct fs_dirent));
+       36:  211:		disk->ops->read(disk, fs_inodes[sb.st_ino].direct[0], 1, fs_dirents);
+        -:  212:
+       36:  213:		int i = 0;
+     1188:  214:		for(i = 0; i < DIRENTS_PER_BLOCK; i++) {
+     1152:  215:			if(fs_dirents[i].valid) {
+      109:  216:				fillStatStruc(&sb, fs_dirents[i].inode);
+      109:  217:				filler(ptr, fs_dirents[i].name, &sb, offset);
+        -:  218:			}
+        -:  219:		}
+        -:  220:	}
+        -:  221:	else {
+        1:  222:		filler(ptr, path, &sb, offset);
+        -:  223:	}
+       37:  224:    return 0;
+        -:  225:}
+        -:  226:
+        -:  227:/* see description of Part 2. In particular, you can save information 
+        -:  228: * in fi->fh. If you allocate memory, free it in fs_releasedir.
+        -:  229: */
+        -:  230:/*
+        -:  231:static int fs_opendir(const char *path, struct fuse_file_info *fi)
+        -:  232:{
+        -:  233:    return 0;
+        -:  234:}
+        -:  235:
+        -:  236:static int fs_releasedir(const char *path, struct fuse_file_info *fi)
+        -:  237:{
+        -:  238:    return 0;
+        -:  239:}*/
+        -:  240:
+        -:  241:/* mknod - create a new file with permissions (mode & 01777)
+        -:  242: *
+        -:  243: * Errors - path resolution, EEXIST
+        -:  244: *          in particular, for mknod("/a/b/c") to succeed,
+        -:  245: *          "/a/b" must exist, and "/a/b/c" must not.
+        -:  246: *
+        -:  247: * If a file or directory of this name already exists, return -EEXIST.
+        -:  248: * If this would result in >32 entries in a directory, return -ENOSPC
+        -:  249: * if !S_ISREG(mode) return -EINVAL [i.e. 'mode' specifies a device special
+        -:  250: * file or other non-file object]
+        -:  251: */
+        8:  252:static int fs_mknod(const char *path, mode_t mode, dev_t dev)
+        -:  253:{
+        8:  254:	if(!S_ISREG(mode))
+    #####:  255:		return -EINVAL;
+        -:  256:	struct fs_dirent *fs_dirents;
+        -:  257:	struct stat sb;
+        -:  258:	char *parentName;
+        -:  259:	char *baseName;
+        -:  260:
+        8:  261:	getBaseNameAndParent(path, &baseName, &parentName);
+        -:  262:
+        -:  263:	//printf("\n%s : %s\n", baseName, parentName);
+        -:  264:
+        8:  265:	int retVal = fs_getattr(parentName, &sb);
+        8:  266:	if(retVal < 0)
+        2:  267:		return retVal;
+        -:  268:
+        -:  269:	// Load the dirents buffer for the inode num
+        6:  270:	fs_dirents = malloc(DIRENTS_PER_BLOCK * sizeof(struct fs_dirent));
+        6:  271:	disk->ops->read(disk, fs_inodes[sb.st_ino].direct[0], 1, fs_dirents);
+        -:  272:
+        -:  273:	/*
+        -:  274:	 * Call handleDirentsBuffer which will 
+        -:  275:	 * - get the first invalid entry in dirents buffer
+        -:  276:	 * - load the invalid entry with the new directory 
+        -:  277:	     to be created i.e. populate the names
+        -:  278:	 */
+        6:  279:	int isFile = 1;
+        6:  280:	retVal = handleDirentsBuffer(fs_dirents, mode, baseName, sb.st_ino, isFile);
+        6:  281:	return retVal;
+        -:  282:	
+        -:  283:}
+        -:  284:
+       10:  285:static int getNewInodeNum() {
+       10:  286:	int i = 0;
+       96:  287:	for(i = 0; i < (INODES_PER_BLK * super_blk.inode_region_sz); i++) {
+       96:  288:		if(!FD_ISSET(i,inode_map)){
+        -:  289:			/* 
+        -:  290:	 	 	 * Set the new inode number and block number returned in 
+        -:  291:	 	 	 * the inode map and block map respectively
+        -:  292:	 	 	 */
+       10:  293:			FD_SET(i, inode_map);
+       10:  294:			return i;
+        -:  295:		}
+        -:  296:	}
+    #####:  297:	return -ENOSPC;
+        -:  298:}
+        -:  299:
+    17527:  300:static int getNewBlockNum() {
+    17527:  301:	int i = 0;
+155045516:  302:	for(i = 0; i < super_blk.num_blocks; i++) {
+155045513:  303:		if(!FD_ISSET(i,block_map)){
+        -:  304:			/* 
+        -:  305:	 	 	* Set the new inode number and block number returned in 
+        -:  306:	 	 	* the inode map and block map respectively
+        -:  307:	 	 	*/
+    17524:  308:			FD_SET(i, block_map);
+    17524:  309:			return i;
+        -:  310:		}
+        -:  311:	}
+        3:  312:	return -ENOSPC;
+        -:  313:}
+        -:  314:
+        9:  315:static void populateInodeForNewDir(mode_t mode, int nodeNum, int blockNum, int isFile){
+        -:  316:	//int super_blk_sz = 1;
+        -:  317:	//Create a new inode entry in fs_inodes buffer
+        9:  318:	struct fuse_context *ctx = fuse_get_context();
+        9:  319:	fs_inodes[nodeNum].uid = ctx->uid;
+        9:  320:	fs_inodes[nodeNum].gid = ctx->gid;
+        9:  321:	if(!isFile) {
+        4:  322:		fs_inodes[nodeNum].mode = mode | S_IFDIR;
+        4:  323:		fs_inodes[nodeNum].direct[0] = blockNum;
+        4:  324:		disk->ops->write(disk, (SUPER_BLK_SZ + super_blk.inode_map_sz), super_blk.block_map_sz, block_map); //writing to block_map
+        -:  325:	}
+        -:  326:	else {
+        5:  327:		fs_inodes[nodeNum].mode = mode | S_IFREG;
+        5:  328:		fs_inodes[nodeNum].direct[0] = 0;
+        -:  329:	}
+        9:  330:	fs_inodes[nodeNum].ctime = (unsigned)time(NULL);
+        9:  331:	fs_inodes[nodeNum].mtime = (unsigned)time(NULL);
+        9:  332:	fs_inodes[nodeNum].size = isFile ? 0 : FS_BLOCK_SIZE;
+        -:  333:	// Assign a new block number for direct[0]
+        9:  334:	fs_inodes[nodeNum].indir_1 = 0;
+        9:  335:	fs_inodes[nodeNum].indir_2 = 0;
+        -:  336:	//marking all other directs = 0
+        9:  337:	int i = 0;
+       54:  338:	for(i = 1; i < DIRECT_BLOCKS; i++)
+       45:  339:		fs_inodes[nodeNum].direct[i] = 0;
+        -:  340:
+        -:  341:	// Write back to the image file
+        9:  342:	disk->ops->write(disk, (SUPER_BLK_SZ + super_blk.inode_map_sz + super_blk.block_map_sz), super_blk.inode_region_sz, fs_inodes); //writing to fs_inodes
+        9:  343:	disk->ops->write(disk, SUPER_BLK_SZ, super_blk.inode_map_sz, inode_map); //writing to inode_map
+        9:  344:}
+        -:  345:
+        9:  346:static void populateDirentForNewDir(int index, int inodeNum, int parentNodeNum, char *dirName, struct fs_dirent *dirent_buff, int isFile){
+        9:  347:	dirent_buff[index].valid = 1;
+        9:  348:	dirent_buff[index].isDir = !isFile;
+        9:  349:	dirent_buff[index].inode = inodeNum;
+        9:  350:	strcpy(dirent_buff[index].name, dirName);
+        -:  351:	// Write back to image file
+        9:  352:	disk->ops->write(disk, fs_inodes[parentNodeNum].direct[0], 1, dirent_buff);
+        9:  353:}
+        -:  354:
+       18:  355:static int getFirstInvalidEntryInDirents(struct fs_dirent *temp, char *baseName){
+       18:  356:	int invalidIndex = -1;
+       18:  357:	int i = 0;
+      509:  358:	for(i = 0; i < DIRENTS_PER_BLOCK; i++) {
+      495:  359:		if(temp[i].valid) {
+       53:  360:			if(!strcmp(temp[i].name, baseName)){
+        -:  361:				// Return entry already exists
+        4:  362:				return -EEXIST;
+        -:  363:			}
+        -:  364:		}
+        -:  365:		else 
+      442:  366:			invalidIndex = i;
+        -:  367:	}
+        -:  368:	
+       14:  369:	return (invalidIndex >= 0 ? invalidIndex : -ENOSPC);
+        -:  370:}
+        -:  371:
+       12:  372:static int handleDirentsBuffer(struct fs_dirent *dirent_buff, mode_t mode, char *newname, int parentDirNodeNum, int isFile) {
+       12:  373:	int nodeNum = 0;
+       12:  374:	int blockNum = 0;
+        -:  375:	/*
+        -:  376:	 * Get the first invalid entry in the dirents buffer 
+        -:  377:	 * for the corresponding inode number 
+        -:  378:	 */
+       12:  379:	int direntIndex = getFirstInvalidEntryInDirents(dirent_buff, newname);
+        -:  380:
+       12:  381:	if(direntIndex >= 0){
+        -:  382:
+       10:  383:		nodeNum = getNewInodeNum();
+       10:  384:		if(!isFile)
+        5:  385:			blockNum = getNewBlockNum();
+       10:  386:		if(nodeNum < 0 || blockNum < 0)
+        1:  387:			return -ENOSPC;
+        -:  388:
+        9:  389:		populateInodeForNewDir(mode, nodeNum, blockNum, isFile);
+        9:  390:		populateDirentForNewDir(direntIndex, nodeNum, parentDirNodeNum, newname, dirent_buff, isFile);
+        -:  391:		
+        9:  392:		return 0;
+        -:  393:	}
+        -:  394:	
+        2:  395:	return direntIndex;
+        -:  396:}
+        -:  397:
+        -:  398:/* mkdir - create a directory with the given mode.
+        -:  399: * Errors - path resolution, EEXIST
+        -:  400: * Conditions for EEXIST are the same as for create. 
+        -:  401: * If this would result in >32 entries in a directory, return -ENOSPC
+        -:  402: *
+        -:  403: * Note that you may want to combine the logic of fs_mknod and
+        -:  404: * fs_mkdir. 
+        -:  405: */ 
+        -:  406:
+       44:  407:static void getBaseNameAndParent(const char *path, char **baseName, char **parentName){
+       44:  408:	char *slash = strrchr(path, '/');
+       44:  409:	int lstSlashIndx = (int)(slash - path);
+       44:  410:	lstSlashIndx += 1;
+        -:  411:
+       44:  412:	*parentName = malloc(lstSlashIndx + 1);
+       44:  413:	*baseName = malloc((strlen(path) - lstSlashIndx) + 1);
+        -:  414:
+       44:  415:	strncpy(*parentName, path, lstSlashIndx);
+       44:  416:	(*parentName)[lstSlashIndx] = '\0';
+        -:  417:
+       44:  418:	strncpy(*baseName, path + lstSlashIndx, strlen(path) - lstSlashIndx);
+       44:  419:	(*baseName)[(strlen(path) - lstSlashIndx)] = '\0';
+       44:  420:}
+        -:  421:
+        7:  422:static int fs_mkdir(const char *path, mode_t mode)
+        -:  423:{
+        -:  424:	struct fs_dirent *fs_dirents;
+        -:  425:	struct stat sb;
+        -:  426:	char *parentName;
+        -:  427:	char *baseName;
+        -:  428:
+        7:  429:	getBaseNameAndParent(path, &baseName, &parentName);
+        -:  430:
+        -:  431:	//printf("\n%s : %s\n", baseName, parentName);
+        -:  432:
+        7:  433:	int retVal = fs_getattr(parentName, &sb);
+        7:  434:	if(retVal < 0)
+        1:  435:		return retVal;
+        -:  436:
+        -:  437:	// Load the dirents buffer for the inode num
+        6:  438:	fs_dirents = malloc(DIRENTS_PER_BLOCK * sizeof(struct fs_dirent));
+        6:  439:	disk->ops->read(disk, fs_inodes[sb.st_ino].direct[0], 1, fs_dirents);
+        -:  440:
+        -:  441:	/*
+        -:  442:	 * Call handleDirentsBuffer which will 
+        -:  443:	 * - get the first invalid entry in dirents buffer
+        -:  444:	 * - load the invalid entry with the new directory 
+        -:  445:	     to be created i.e. populate the names
+        -:  446:	 */
+        6:  447:	int isFile = 0;
+        6:  448:	retVal = handleDirentsBuffer(fs_dirents, mode, baseName, sb.st_ino, isFile);
+        6:  449:	return retVal;
+        -:  450:	
+        -:  451:}
+        -:  452:
+        5:  453:static void truncFile(int inodenum, int len) {
+        -:  454:	//check direct
+        5:  455:	int i = 0;
+        -:  456:	char nullBlock[FS_BLOCK_SIZE];
+        5:  457:	memset(nullBlock, '\0', FS_BLOCK_SIZE);
+        -:  458:
+       26:  459:	for(i = 0; i < DIRECT_BLOCKS; i++) {
+       23:  460:		if(fs_inodes[inodenum].direct[i] != 0) {
+        -:  461:			//free blocknum and write null to block
+       21:  462:			FD_CLR(fs_inodes[inodenum].direct[i], block_map);
+       21:  463:			disk->ops->write(disk, fs_inodes[inodenum].direct[i], 1, nullBlock); //writing nullblock to freed block
+        -:  464:			
+        -:  465:			//mark direct[i] = 0
+       21:  466:			fs_inodes[inodenum].direct[i] = 0;
+        -:  467:		}
+        -:  468:		else
+        2:  469:			break;
+        -:  470:	}
+        5:  471:	if(fs_inodes[inodenum].indir_1 != 0) {
+        -:  472:		//remove blocks from indir1
+        -:  473:		//read block indir1 from disk
+        -:  474:		int indirl1 [FS_BLOCK_SIZE/sizeof(int)];
+        3:  475:		disk->ops->read(disk, fs_inodes[inodenum].indir_1, 1, &indirl1);
+      516:  476:		for(i = 0; i < INDIRECT_BLOCKS; i++) {
+      514:  477:			if(indirl1[i] != 0) {
+        -:  478:				//free blocknum and write null to block
+      513:  479:				FD_CLR(indirl1[i], block_map);
+      513:  480:				disk->ops->write(disk, indirl1[i], 1, nullBlock); //writing nullblock to freed block
+        -:  481:				
+        -:  482:				//mark direct[i] = 0-- No need
+      513:  483:				indirl1[i] = 0;
+        -:  484:			}
+        -:  485:			else
+        1:  486:				break;
+        -:  487:		}
+        3:  488:		FD_CLR(fs_inodes[inodenum].indir_1, block_map);
+        -:  489:		//clearing indir_1 block
+        3:  490:		disk->ops->write(disk, fs_inodes[inodenum].indir_1, 1, nullBlock); //writing nullblock to freed block
+        3:  491:		fs_inodes[inodenum].indir_1 = 0;
+        -:  492:	}
+        5:  493:	if(fs_inodes[inodenum].indir_2 != 0) {
+        -:  494:		//remove blocks from indir1
+        -:  495:		//read block indir2 from disk
+        2:  496:		int j = 0;
+        -:  497:		int indirl2 [FS_BLOCK_SIZE/sizeof(int)];
+        -:  498:		int indirl1 [FS_BLOCK_SIZE/sizeof(int)];
+        2:  499:		disk->ops->read(disk, fs_inodes[inodenum].indir_2, 1, &indirl1);
+        4:  500:		for(i = 0; i < INDIRECT_BLOCKS; i++) {
+        4:  501:			if(indirl1[i]) {
+        2:  502:				disk->ops->read(disk, indirl1[i], 1, &indirl2);
+       18:  503:				for(j = 0; j < INDIRECT_BLOCKS; j++) {
+       18:  504:					if(indirl2[j] != 0) {
+        -:  505:						//free blocknum and write null to block
+       16:  506:						FD_CLR(indirl2[j], block_map);
+       16:  507:						disk->ops->write(disk, indirl2[j], 1, nullBlock); //writing nullblock to freed block
+        -:  508:						//mark direct[i] = 0
+        -:  509:						//indirl2[j] = 0;
+        -:  510:					}
+        -:  511:					else
+        2:  512:						break;
+        -:  513:				}
+        2:  514:				FD_CLR(indirl1[i], block_map);
+        -:  515:				//clearing indir_1 block
+        2:  516:				disk->ops->write(disk, indirl1[i], 1, nullBlock); //writing nullblock to freed block
+        -:  517:				//indirl1[i] = 0;
+        -:  518:			}
+        -:  519:			else
+        2:  520:				break;
+        -:  521:		}
+        2:  522:		FD_CLR(fs_inodes[inodenum].indir_2, block_map);
+        -:  523:		//clearing indir_2 block
+        2:  524:		disk->ops->write(disk, fs_inodes[inodenum].indir_2, 1, nullBlock); //writing nullblock to freed block
+        2:  525:		fs_inodes[inodenum].indir_2 = 0;
+        -:  526:	}
+        -:  527:	//writing block_map back to disk
+        5:  528:	disk->ops->write(disk, SUPER_BLK_SZ + super_blk.inode_map_sz, super_blk.block_map_sz, block_map); //writing block map	
+        -:  529:
+        -:  530:	//writing back fs_inodes to disk
+        5:  531:	fs_inodes[inodenum].size = len;
+        5:  532:	fs_inodes[inodenum].mtime = time(NULL);
+        5:  533:	disk->ops->write(disk, (SUPER_BLK_SZ + super_blk.inode_map_sz + super_blk.block_map_sz), super_blk.inode_region_sz, fs_inodes);
+        5:  534:}
+        -:  535:
+        -:  536:/* truncate - truncate file to exactly 'len' bytes
+        -:  537: * Errors - path resolution, ENOENT, EISDIR, EINVAL
+        -:  538: *    return EINVAL if len > 0.
+        -:  539: */
+        6:  540:static int fs_truncate(const char *path, off_t len)
+        -:  541:{
+        -:  542:    /* you can cheat by only implementing this for the case of len==0,
+        -:  543:     * and an error otherwise.
+        -:  544:     */
+        6:  545:        if (len != 0)
+    #####:  546:		return -EINVAL;		/* invalid argument */
+        -:  547:	struct stat sb;
+        -:  548:	/*
+        -:  549:	 * Calling fs_getattr to validate the input path 
+        -:  550:	 */
+        6:  551:	int retval = fs_getattr(path, &sb);
+        6:  552:	if(retval < 0)
+        2:  553:		return retval; /* Return if path is not valid */
+        -:  554:
+        4:  555:	if(S_ISDIR(sb.st_mode))
+        1:  556:		return -EISDIR; /* Return error if it's a directory */
+        -:  557:
+        3:  558:	truncFile(sb.st_ino, len); //len will always be 0-- we're cheating ..!!
+        -:  559:	
+        3:  560:	return 0;
+        -:  561:}
+        -:  562:
+        -:  563:/* unlink - delete a file
+        -:  564: *  Errors - path resolution, ENOENT, EISDIR
+        -:  565: * Note that you have to delete (i.e. truncate) all the data.
+        -:  566: */
+        5:  567:static int fs_unlink(const char *path)
+        -:  568:{
+        5:  569:	int rmvIndx = -1;
+        -:  570:	struct stat sb;
+        -:  571:	char *parentName;
+        -:  572:	char *baseName;
+        -:  573:	struct fs_dirent *fs_dirents;
+        -:  574:
+        5:  575:	getBaseNameAndParent(path, &baseName, &parentName);
+        5:  576:	int retval = fs_getattr(parentName, &sb);
+        5:  577:	if(retval < 0)
+        1:  578:		return retval;
+        -:  579:	
+        -:  580:	// Load the dirents buffer from inode number
+        4:  581:	fs_dirents = malloc(DIRENTS_PER_BLOCK * sizeof(struct fs_dirent));
+        4:  582:	disk->ops->read(disk, fs_inodes[sb.st_ino].direct[0], 1, fs_dirents);
+        -:  583:
+        -:  584:	// Get the inode num of dir to be removed
+        4:  585:	int nodeNum = getInodeNum(baseName, fs_dirents, &rmvIndx);
+        -:  586:
+        4:  587:	if(nodeNum >= 0){
+        3:  588:		if(fs_dirents[rmvIndx].isDir)
+        1:  589:			return -EISDIR;
+        -:  590:		//truncate file
+        -:  591:
+        2:  592:		truncFile(nodeNum, 0);
+        2:  593:		return removeDirOrFile(nodeNum, rmvIndx, fs_dirents, sb.st_ino, fs_dirents[rmvIndx].isDir);
+        -:  594:	}
+        1:  595:	return nodeNum;
+        -:  596:}
+        -:  597:
+        8:  598:static int removeDirOrFile(int nodeNum, int rmvIndx, struct fs_dirent *dirent_buff, int parentNodeNum, int isDir) {
+        -:  599:
+        8:  600:	if(isDir) {
+        6:  601:		int i = 0;
+        -:  602:		struct fs_dirent *child_dirent;
+        -:  603:		// Load the dirents buffer from inode number
+        6:  604:		child_dirent = malloc(DIRENTS_PER_BLOCK * sizeof(struct fs_dirent));
+        6:  605:		disk->ops->read(disk, fs_inodes[nodeNum].direct[0], 1, child_dirent);
+        -:  606:
+      196:  607:		for(i = 0; i < DIRENTS_PER_BLOCK; i++){
+      192:  608:			if(child_dirent[i].valid){
+        2:  609:				return -ENOTEMPTY;
+        -:  610:			}
+        -:  611:		}
+        4:  612:		FD_CLR(fs_inodes[nodeNum].direct[0], block_map);
+        4:  613:		disk->ops->write(disk, 2, 1, block_map); //writing to block_map
+        -:  614:	}
+        6:  615:	FD_CLR(nodeNum, inode_map);
+        -:  616:
+        -:  617:	//fill dirent_buff
+        6:  618:	dirent_buff[rmvIndx].valid = 0;
+        6:  619:	dirent_buff[rmvIndx].isDir = 0;
+        -:  620:
+        -:  621:	//write back to disk
+        -:  622:	//disk->ops->write(disk, SUPER_BLK_SZ + super_blk.inode_map_sz + super_blk.block_map_sz, super_blk.inode_region_sz, fs_inodes); //writing to fs_inodes
+        6:  623:	disk->ops->write(disk, SUPER_BLK_SZ, super_blk.inode_map_sz, inode_map); //writing to inode_map
+        6:  624:	disk->ops->write(disk, fs_inodes[parentNodeNum].direct[0], 1, dirent_buff);
+        6:  625:	return 0;
+        -:  626:} 
+        -:  627:
+       12:  628:static int getInodeNum(char *baseName, struct fs_dirent *dirent_buff, int *rmvIndx){
+       12:  629:	int i = 0;
+      280:  630:	for(i = 0; i < DIRENTS_PER_BLOCK; i++){
+      278:  631:		if(dirent_buff[i].valid && !strcmp(dirent_buff[i].name, baseName)){
+       10:  632:			*rmvIndx = i;
+       10:  633:			return dirent_buff[i].inode;
+        -:  634:		}
+        -:  635:	}
+        2:  636:	return -ENOENT;
+        -:  637:}
+        -:  638:
+        -:  639:/* rmdir - remove a directory
+        -:  640: *  Errors - path resolution, ENOENT, ENOTDIR, ENOTEMPTY
+        -:  641: */
+        8:  642:static int fs_rmdir(const char *path)
+        -:  643:{	
+        8:  644:	int rmvIndx = -1;
+        -:  645:	struct stat sb;
+        -:  646:	char *parentName;
+        -:  647:	char *baseName;
+        -:  648:	struct fs_dirent *fs_dirents;
+        -:  649:
+        8:  650:	getBaseNameAndParent(path, &baseName, &parentName);
+        8:  651:	int retval = fs_getattr(parentName, &sb);
+        8:  652:	if(retval < 0)
+    #####:  653:		return retval;
+        -:  654:	
+        -:  655:	// Load the dirents buffer from inode number
+        8:  656:	fs_dirents = malloc(DIRENTS_PER_BLOCK * sizeof(struct fs_dirent));
+        8:  657:	disk->ops->read(disk, fs_inodes[sb.st_ino].direct[0], 1, fs_dirents);
+        -:  658:
+        -:  659:	// Get the inode num of dir to be removed
+        8:  660:	int nodeNum = getInodeNum(baseName, fs_dirents, &rmvIndx);
+        8:  661:	if(!fs_dirents[rmvIndx].isDir)
+        1:  662:		return -ENOTDIR;
+        7:  663:	if(nodeNum >= 0){
+        6:  664:		return removeDirOrFile(nodeNum, rmvIndx, fs_dirents, sb.st_ino, fs_dirents[rmvIndx].isDir);
+        -:  665:	}
+        1:  666:	return nodeNum;
+        -:  667:}
+        -:  668:
+        -:  669:/* rename - rename a file or directory
+        -:  670: * Errors - path resolution, ENOENT, EINVAL, EEXIST
+        -:  671: *
+        -:  672: * ENOENT - source does not exist
+        -:  673: * EEXIST - destination already exists
+        -:  674: * EINVAL - source and destination are not in the same directory
+        -:  675: *
+        -:  676: * Note that this is a simplified version of the UNIX rename
+        -:  677: * functionality - see 'man 2 rename' for full semantics. In
+        -:  678: * particular, the full version can move across directories, replace a
+        -:  679: * destination file, and replace an empty directory with a full one.
+        -:  680: */
+        8:  681:static int fs_rename(const char *src_path, const char *dst_path)
+        -:  682:{
+        8:  683:	char *_src_path = strdup(src_path);
+        8:  684:	char *_dst_path = strdup(dst_path);
+        8:  685:	int i = 0;
+        -:  686:	char *src;
+        -:  687:	char *dest;
+        -:  688:	char *srcParentName;
+        -:  689:	char *dstParentName;
+        -:  690:	struct stat sb;
+        -:  691:	struct fs_dirent *dirent_buff;
+        -:  692:	
+        8:  693:	getBaseNameAndParent(_src_path, &src, &srcParentName);
+        8:  694:	getBaseNameAndParent(_dst_path, &dest, &dstParentName);
+        -:  695:	
+        8:  696:	if(!strcmp(srcParentName, dstParentName)){
+        -:  697:		// Both parent directories match; hence can perform renaming of files
+        7:  698:			int retval = fs_getattr(srcParentName, &sb);
+        7:  699:			if(retval < 0)
+    #####:  700:				return retval;
+        -:  701:	
+        -:  702:		// Load the dirents buffer from inode number
+        7:  703:			dirent_buff = malloc(DIRENTS_PER_BLOCK * sizeof(struct fs_dirent));
+        7:  704:			disk->ops->read(disk, fs_inodes[sb.st_ino].direct[0], 1, dirent_buff);
+        -:  705:				
+        7:  706:			if(strcmp(src, dest)){	
+        6:  707:				if(getFirstInvalidEntryInDirents(dirent_buff, dest) == -EEXIST)
+        2:  708:					return -EEXIST;
+        -:  709:			}
+        -:  710:			// Loop into the dirents buff to find the src file
+       55:  711:			for(i = 0; i < DIRENTS_PER_BLOCK; i++){
+       54:  712:				if(dirent_buff[i].valid && !strcmp(dirent_buff[i].name, src)){
+        4:  713:					strcpy(dirent_buff[i].name, dest);
+        4:  714:					disk->ops->write(disk, fs_inodes[sb.st_ino].direct[0], 1, dirent_buff);
+        4:  715:					return 0;
+        -:  716:				}
+        -:  717:			}
+        -:  718:			
+        1:  719:			return -ENOENT;
+        -:  720:		}
+        1:  721:		return -EINVAL;
+        -:  722:}
+        -:  723:
+        -:  724:/* chmod - change file permissions
+        -:  725: * utime - change access and modification times
+        -:  726: *         (for definition of 'struct utimebuf', see 'man utime')
+        -:  727: *
+        -:  728: * Errors - path resolution, ENOENT.
+        -:  729: */
+        6:  730:static int fs_chmod(const char *path, mode_t mode)
+        -:  731:{
+        -:  732:	struct stat sb;
+        -:  733:
+        6:  734:	int retval = fs_getattr(path, &sb);
+        6:  735:	if(retval < 0)
+        1:  736:		return retval;
+        -:  737:	
+        -:  738:	//set permissions for inodenum
+        5:  739:	if(S_ISDIR(sb.st_mode))
+        3:  740:		fs_inodes[sb.st_ino].mode = mode | S_IFDIR;
+        -:  741:	else
+        2:  742:		fs_inodes[sb.st_ino].mode = mode | S_IFREG;
+        -:  743:
+        -:  744:	// Write back to the image file
+        -:  745:	//writing to fs_inodes
+        5:  746:	disk->ops->write(disk, SUPER_BLK_SZ + super_blk.inode_map_sz + super_blk.block_map_sz, super_blk.inode_region_sz, fs_inodes); 
+        5:  747:	return 0;
+        -:  748:}
+        -:  749:
+        1:  750:int fs_utime(const char *path, struct utimbuf *ut)
+        -:  751:{
+        -:  752:	struct stat sb;
+        -:  753:
+        1:  754:	int retval = fs_getattr(path, &sb);
+        1:  755:	if(retval < 0)
+    #####:  756:		return retval;
+        -:  757:	
+        -:  758:	if(sb.st_ino >= 0) {
+        1:  759:		fs_inodes[sb.st_ino].mtime = ut->modtime;
+        -:  760:
+        -:  761:		// Write back to the image file
+        1:  762:		disk->ops->write(disk, 3, 4, fs_inodes); //writing to fs_inodes
+        1:  763:		return 0;
+        -:  764:	}
+        -:  765:	
+        -:  766:        return -ENOENT;
+        -:  767:}
+        -:  768:
+    36256:  769:static void getBlockAndIndex(int *blocknum, int *startindex, int offset) {	
+    36256:  770:	*blocknum = offset / FS_BLOCK_SIZE;
+    36256:  771:	*startindex = offset % FS_BLOCK_SIZE;
+    36256:  772:}
+        -:  773:
+     1084:  774:static int min(int a, int b, int c) {
+     1084:  775:	return MIN(MIN(a, b), c);
+        -:  776:}
+        -:  777:
+      285:  778:static void readFromDataBlocks(int offset, int blksize, int inodenum, char **buf) {
+        -:  779:	int blocknum;
+        -:  780:	int startindex;
+      285:  781:	int read = 0;
+        -:  782:
+      285:  783:	char *auxbuf = calloc(1,FS_BLOCK_SIZE);
+      285:  784:	memset(*buf, '\0', blksize);
+     1654:  785:	while(strlen(*buf) < blksize && offset < fs_inodes[inodenum].size) {
+     1084:  786:		getBlockAndIndex(&blocknum, &startindex, offset);
+     1084:  787:		if(blocknum < DIRECT_BLOCKS){
+       24:  788:			if(!fs_inodes[inodenum].direct[blocknum])
+    #####:  789:				break;
+       24:  790:			disk->ops->read(disk, fs_inodes[inodenum].direct[blocknum], 1, auxbuf);
+     1060:  791:		}else if (blocknum < (INDIRECT_BLOCKS + DIRECT_BLOCKS)){
+        -:  792:			int indirectPtr1Buf[INDIRECT_BLOCKS];
+     1028:  793:			disk->ops->read(disk, fs_inodes[inodenum].indir_1, 1, &indirectPtr1Buf);
+     1028:  794:			disk->ops->read(disk, indirectPtr1Buf[blocknum - DIRECT_BLOCKS], 1, auxbuf);
+        -:  795:		}else {
+        -:  796:			int indirectPtr2Buf1[INDIRECT_BLOCKS];
+        -:  797:			int indirectPtr2Buf2[INDIRECT_BLOCKS];
+       32:  798:			disk->ops->read(disk, fs_inodes[inodenum].indir_2, 1, &indirectPtr2Buf1);
+       32:  799:			int lvl1Indx = (blocknum - DIRECT_BLOCKS - INDIRECT_BLOCKS);
+       32:  800:			disk->ops->read(disk, indirectPtr2Buf1[lvl1Indx / INDIRECT_BLOCKS], 1, &indirectPtr2Buf2);
+        -:  801:			
+       32:  802:			disk->ops->read(disk, indirectPtr2Buf2[lvl1Indx % INDIRECT_BLOCKS], 1, auxbuf);
+        -:  803:		}
+     1084:  804:		int minimum  = min((FS_BLOCK_SIZE - startindex), (blksize - read), (fs_inodes[inodenum].size - offset));
+     1084:  805:		strncpy(&(*buf)[read] , auxbuf + startindex, minimum);
+     1084:  806:		offset += minimum;
+     1084:  807:		read += minimum;
+        -:  808:	}
+      285:  809:}
+        -:  810:
+        -:  811:/* read - read data from an open file.
+        -:  812: * should return exactly the number of bytes requested, except:
+        -:  813: *   - if offset >= file len, return 0
+        -:  814: *   - if offset+len > file len, return bytes from offset to EOF
+        -:  815: *   - on error, return <0
+        -:  816: * Errors - path resolution, ENOENT, EISDIR
+        -:  817: */
+      287:  818:static int fs_read(const char *path, char *buf, size_t len, off_t offset,
+        -:  819:		    struct fuse_file_info *fi)
+        -:  820:{
+        -:  821:	struct stat sb;
+      287:  822:	memset(buf, '\0', len + 1);
+        -:  823:	/*
+        -:  824:	 * Calling fs_getattr to validate the input path 
+        -:  825:	 */
+      287:  826:	int retval = fs_getattr(path, &sb);
+      287:  827:	if(retval < 0)
+        1:  828:		return retval; /* Return if path is not valid */
+      286:  829:	if(S_ISDIR(sb.st_mode))
+        1:  830:		return -EISDIR; /* Return error if it's a directory */
+        -:  831:	
+      285:  832:	readFromDataBlocks(offset, len, sb.st_ino, &buf);
+      285:  833:	return strlen(buf);
+        -:  834:}
+        -:  835:
+       49:  836:static int populateDirectBlocks(int fileNodeNum, int blocknum){
+        -:  837:	//if block allocated previously do not call getNewBlockNum()
+       49:  838:	if(!fs_inodes[fileNodeNum].direct[blocknum]) {
+       25:  839:		int newBlockNum = getNewBlockNum();
+       25:  840:		if(newBlockNum < 0)
+        1:  841:			return -ENOSPC;
+       24:  842:		fs_inodes[fileNodeNum].direct[blocknum] = newBlockNum;
+       24:  843:		disk->ops->write(disk, fs_inodes[fileNodeNum].direct[blocknum], 1, globalBuf);
+       24:  844:		disk->ops->write(disk, (SUPER_BLK_SZ + super_blk.inode_map_sz), super_blk.block_map_sz, block_map); //writing to block_map
+        -:  845:	}
+        -:  846:	//overwrite the previous block with globalBuf
+        -:  847:	else {	
+       24:  848:		disk->ops->write(disk, fs_inodes[fileNodeNum].direct[blocknum], 1, globalBuf);
+        -:  849:	}
+       48:  850:	return 0;
+        -:  851:}
+        -:  852:
+     1908:  853:static int populateIndirectPtr1Blocks(int fileNodeNum, int blocknum){
+        -:  854:	int indirectPtr1Buf[INDIRECT_BLOCKS];
+        -:  855:	//if block allocated previously do not call getNewBlockNum()
+     1908:  856:	if(!fs_inodes[fileNodeNum].indir_1) {
+        4:  857:		blockForIndir1 = getNewBlockNum();
+        4:  858:		if(blockForIndir1 < 0)
+    #####:  859:			return -ENOSPC;
+        4:  860:		fs_inodes[fileNodeNum].indir_1 = blockForIndir1;
+        -:  861:		
+        4:  862:		int newBlockNum = getNewBlockNum();
+        4:  863:		if(newBlockNum < 0)
+    #####:  864:			return -ENOSPC;
+        4:  865:		disk->ops->read(disk, blockForIndir1, 1, &indirectPtr1Buf);
+        4:  866:		memset(indirectPtr1Buf, 0, INDIRECT_BLOCKS);
+        -:  867:		
+        4:  868:		indirectPtr1Buf[blocknum - DIRECT_BLOCKS] = newBlockNum;
+        4:  869:		disk->ops->write(disk, blockForIndir1, 1, &indirectPtr1Buf);
+        4:  870:		disk->ops->write(disk, indirectPtr1Buf[blocknum - DIRECT_BLOCKS], 1, globalBuf);
+        -:  871:	}
+        -:  872:	//overwrite the previous block with globalBuf
+        -:  873:	else {	
+     1904:  874:		disk->ops->read(disk, blockForIndir1, 1, &indirectPtr1Buf);
+     1904:  875:		if(!indirectPtr1Buf[blocknum - DIRECT_BLOCKS]){
+      943:  876:			int newBlockNum = getNewBlockNum();
+      943:  877:			if(newBlockNum < 0)
+        1:  878:				return -ENOSPC;
+      942:  879:			indirectPtr1Buf[blocknum - DIRECT_BLOCKS] = newBlockNum;
+      942:  880:			disk->ops->write(disk, blockForIndir1, 1, &indirectPtr1Buf);
+      942:  881:			disk->ops->write(disk, indirectPtr1Buf[blocknum - DIRECT_BLOCKS], 1, globalBuf);
+        -:  882:		}
+        -:  883:		else{
+      961:  884:			disk->ops->write(disk, indirectPtr1Buf[blocknum - DIRECT_BLOCKS], 1, globalBuf);
+        -:  885:		}
+        -:  886:	}
+     1907:  887:	disk->ops->write(disk, (SUPER_BLK_SZ + super_blk.inode_map_sz), super_blk.block_map_sz, block_map); //writing to block_map
+     1907:  888:	return 0;	
+        -:  889:}
+        -:  890:
+    33215:  891:static int populateIndirectPtr2Blocks(int fileNodeNum, int blocknum){
+        -:  892:	int indirectPtr2Buf1[INDIRECT_BLOCKS];
+        -:  893:	int indirectPtr2Buf2[INDIRECT_BLOCKS];
+    33215:  894:	int lvlIndx = (blocknum - DIRECT_BLOCKS - INDIRECT_BLOCKS);
+        -:  895:	//if block allocated previously do not call getNewBlockNum()
+    33215:  896:	if(!fs_inodes[fileNodeNum].indir_2) {
+        -:  897:		/*
+        -:  898:		 * Get level 1 block, populate it with level 2 block
+        -:  899:		 * and write back to disk
+        -:  900:		 */
+        3:  901:		int blockForIndir2 = getNewBlockNum();
+        3:  902:		if(blockForIndir2 < 0)
+    #####:  903:			return -ENOSPC;
+        3:  904:		fs_inodes[fileNodeNum].indir_2 = blockForIndir2;
+        3:  905:		disk->ops->read(disk, blockForIndir2, 1, &indirectPtr2Buf1);
+        -:  906:		
+        3:  907:		int blockForIndir2lvl1 = getNewBlockNum();
+        3:  908:		if(blockForIndir2lvl1 < 0)
+    #####:  909:			return -ENOSPC;
+        3:  910:		memset(indirectPtr2Buf1, 0, INDIRECT_BLOCKS);
+        3:  911:		indirectPtr2Buf1[lvlIndx / INDIRECT_BLOCKS] = blockForIndir2lvl1;
+        3:  912:		disk->ops->write(disk, blockForIndir2, 1, &indirectPtr2Buf1);
+        -:  913:		
+        3:  914:		disk->ops->read(disk, blockForIndir2lvl1, 1, &indirectPtr2Buf2);
+        3:  915:		int blockForIndir2lvl2 = getNewBlockNum();
+        3:  916:		if(blockForIndir2lvl2 < 0)
+    #####:  917:			return -ENOSPC;
+        3:  918:		memset(indirectPtr2Buf2, 0, INDIRECT_BLOCKS);
+        3:  919:		indirectPtr2Buf2[lvlIndx % INDIRECT_BLOCKS] = blockForIndir2lvl2;
+        3:  920:		disk->ops->write(disk, blockForIndir2lvl1, 1, &indirectPtr2Buf2);
+        -:  921:		
+        3:  922:		disk->ops->write(disk, blockForIndir2lvl2, 1, globalBuf);
+        -:  923:		
+        -:  924:	}
+        -:  925:	//overwrite the previous block with globalBuf
+        -:  926:	else {	
+    33212:  927:		disk->ops->read(disk, fs_inodes[fileNodeNum].indir_2, 1, &indirectPtr2Buf1);
+    33212:  928:		if(!indirectPtr2Buf1[lvlIndx / INDIRECT_BLOCKS]){
+        -:  929:			
+       64:  930:			int blockForIndir2lvl1 = getNewBlockNum();
+       64:  931:			if(blockForIndir2lvl1 < 0)
+    #####:  932:				return -ENOSPC;
+       64:  933:			indirectPtr2Buf1[lvlIndx / INDIRECT_BLOCKS] = blockForIndir2lvl1;
+       64:  934:			disk->ops->write(disk, fs_inodes[fileNodeNum].indir_2, 1, &indirectPtr2Buf1);
+        -:  935:		
+       64:  936:			disk->ops->read(disk, blockForIndir2lvl1, 1, &indirectPtr2Buf2);
+       64:  937:			int blockForIndir2lvl2 = getNewBlockNum();
+       64:  938:			if(blockForIndir2lvl2 < 0)
+    #####:  939:				return -ENOSPC;
+       64:  940:			memset(indirectPtr2Buf2, 0, INDIRECT_BLOCKS);
+       64:  941:			indirectPtr2Buf2[lvlIndx % INDIRECT_BLOCKS] = blockForIndir2lvl2;
+       64:  942:			disk->ops->write(disk, blockForIndir2lvl1, 1, &indirectPtr2Buf2);
+        -:  943:		
+       64:  944:			disk->ops->write(disk, blockForIndir2lvl2, 1, globalBuf);
+        -:  945:		}
+        -:  946:		else{
+    33148:  947:			disk->ops->read(disk, indirectPtr2Buf1[lvlIndx / INDIRECT_BLOCKS], 1, &indirectPtr2Buf2);
+    33148:  948:			if(!indirectPtr2Buf2[lvlIndx % INDIRECT_BLOCKS]){
+    16409:  949:				int blockForIndir2lvl2 = getNewBlockNum();
+    16409:  950:				if(blockForIndir2lvl2 < 0)
+    #####:  951:					return -ENOSPC;
+    16409:  952:				indirectPtr2Buf2[lvlIndx % INDIRECT_BLOCKS] = blockForIndir2lvl2;
+    16409:  953:				disk->ops->write(disk, indirectPtr2Buf1[lvlIndx / INDIRECT_BLOCKS], 1, &indirectPtr2Buf2);
+    16409:  954:				disk->ops->write(disk, blockForIndir2lvl2, 1, globalBuf);
+        -:  955:				
+        -:  956:			}else{
+    16739:  957:				disk->ops->write(disk, indirectPtr2Buf2[lvlIndx % INDIRECT_BLOCKS], 1, globalBuf);
+        -:  958:			}
+        -:  959:		}
+        -:  960:	}
+        -:  961:	
+    33215:  962:	disk->ops->write(disk, (SUPER_BLK_SZ + super_blk.inode_map_sz), super_blk.block_map_sz, block_map); //writing to block_map
+    33215:  963:	return 0;	
+        -:  964:}
+        -:  965:
+    17867:  966:static int writeBlock(int inodenum, int offset, int len, const char **buf) {
+        -:  967:	int blocknum;
+        -:  968:	int startindex;
+    17867:  969:	int read = 0;
+    17867:  970:	int retval = 0;
+        -:  971:
+    70904:  972:	while(read < len) {
+    35172:  973:		getBlockAndIndex(&blocknum, &startindex, offset);
+    35172:  974:		int minimum  = MIN((FS_BLOCK_SIZE - startindex), (len - read));
+    35172:  975:		strncpy(globalBuf + startindex, *buf + read, minimum);
+        -:  976:		
+    35172:  977:		if(blocknum < DIRECT_BLOCKS){
+       49:  978:			retval = populateDirectBlocks(inodenum, blocknum);
+    35123:  979:		}else if (blocknum < DIRECT_BLOCKS + INDIRECT_BLOCKS){
+     1908:  980:			retval = populateIndirectPtr1Blocks(inodenum, blocknum);
+        -:  981:		}else{
+    33215:  982:			retval = populateIndirectPtr2Blocks(inodenum, blocknum);
+        -:  983:		}
+        -:  984:
+    35172:  985:		offset += minimum;
+    35172:  986:		read += minimum;
+        -:  987:		
+        -:  988:		//Empty the globalBuf in case if it's full
+    35172:  989:		if(strlen(globalBuf) == FS_BLOCK_SIZE)
+    17443:  990:			memset(globalBuf, '\0', FS_BLOCK_SIZE);
+    35172:  991:		if(retval < 0)
+        2:  992:			break;
+        -:  993:	}
+    17867:  994:	fs_inodes[inodenum].mtime = (unsigned)time(NULL);
+    17867:  995:	fs_inodes[inodenum].size += len;
+        -:  996:	//writing to fs_inodes
+    17867:  997:	disk->ops->write(disk, (SUPER_BLK_SZ + super_blk.inode_map_sz + super_blk.block_map_sz), super_blk.inode_region_sz, fs_inodes);
+    17867:  998:	return retval < 0 ? retval : len;
+        -:  999:}
+        -: 1000:
+        -: 1001:/* write - write data to a file
+        -: 1002: * It should return exactly the number of bytes requested, except on
+        -: 1003: * error.
+        -: 1004: * Errors - path resolution, ENOENT, EISDIR
+        -: 1005: *  return EINVAL if 'offset' is greater than current file length.
+        -: 1006: *  (POSIX semantics support the creation of files with "holes" in them, 
+        -: 1007: *   but we don't)
+        -: 1008: */
+    17867: 1009:static int fs_write(const char *path, const char *buf, size_t len,
+        -: 1010:		     off_t offset, struct fuse_file_info *fi)
+        -: 1011:{
+        -: 1012:	//getattr- inodenum of file
+        -: 1013:	struct stat sb;
+        -: 1014:	/*
+        -: 1015:	 * Calling fs_getattr to validate the input path 
+        -: 1016:	 */
+    17867: 1017:	int retval = fs_getattr(path, &sb);
+    17867: 1018:	if(retval < 0)
+    #####: 1019:		return retval; /* Return if path is not valid */
+    17867: 1020:	if(S_ISDIR(sb.st_mode))
+    #####: 1021:		return -EISDIR; /* Return error if it's a directory */
+        -: 1022:		
+        -: 1023:	/*
+        -: 1024:	 * Initialize the global buffer in case of 
+        -: 1025:	 * first call to write function for a file
+        -: 1026:	 */
+    17867: 1027:	if(!offset){
+        5: 1028:		memset(globalBuf, '\0', FS_BLOCK_SIZE);
+        -: 1029:	}
+    17867: 1030:	return writeBlock(sb.st_ino, offset, len, &buf);
+        -: 1031:}
+        -: 1032:/*
+        -: 1033:static int fs_open(const char *path, struct fuse_file_info *fi)
+        -: 1034:{
+        -: 1035:    return 0;
+        -: 1036:}
+        -: 1037:
+        -: 1038:static int fs_release(const char *path, struct fuse_file_info *fi)
+        -: 1039:{
+        -: 1040:    return 0;
+        -: 1041:}
+        -: 1042:* */
+        1: 1043:static int calculateUsedBlocks(){
+        1: 1044:	int i, count = 0;
+     1025: 1045:	for(i = 0; i < super_blk.num_blocks; i++) {
+     1024: 1046:		if(FD_ISSET(i,block_map)){
+        -: 1047:			/* 
+        -: 1048:	 	 	* Increment counter for used blocks
+        -: 1049:	 	 	*/
+       20: 1050:			count++;
+        -: 1051:		}
+        -: 1052:	}
+        1: 1053:	return count;
+        -: 1054:}
+        -: 1055:/* statfs - get file system statistics
+        -: 1056: * see 'man 2 statfs' for description of 'struct statvfs'.
+        -: 1057: * Errors - none. 
+        -: 1058: */
+        1: 1059:static int fs_statfs(const char *path, struct statvfs *st)
+        -: 1060:{
+        -: 1061:    /* needs to return the following fields (set others to zero):
+        -: 1062:     *   f_bsize = BLOCK_SIZE
+        -: 1063:     *   f_blocks = total image - metadata
+        -: 1064:     *   f_bfree = f_blocks - blocks used
+        -: 1065:     *   f_bavail = f_bfree
+        -: 1066:     *   f_namelen = <whatever your max namelength is>
+        -: 1067:     *
+        -: 1068:     * this should work fine, but you may want to add code to
+        -: 1069:     * calculate the correct values later.
+        -: 1070:     */
+        1: 1071:    st->f_bsize = FS_BLOCK_SIZE;
+        1: 1072:    st->f_blocks = super_blk.num_blocks - (SUPER_BLK_SZ + super_blk.inode_map_sz + super_blk.block_map_sz + super_blk.root_inode + super_blk.inode_region_sz);           /* probably want to */
+        1: 1073:    st->f_bfree = super_blk.num_blocks - (calculateUsedBlocks());            /* change these */
+        1: 1074:    st->f_bavail = st->f_bfree;           /* values */
+        1: 1075:    st->f_namemax = 27;
+        -: 1076:
+        1: 1077:    return 0;
+        -: 1078:}
+        -: 1079:
+        -: 1080:/* operations vector. Please don't rename it, as the skeleton code in
+        -: 1081: * misc.c assumes it is named 'fs_ops'.
+        -: 1082: */
+        -: 1083:struct fuse_operations fs_ops = {
+        -: 1084:    .init = fs_init,
+        -: 1085:    .getattr = fs_getattr,
+        -: 1086:    //.opendir = fs_opendir,
+        -: 1087:    .readdir = fs_readdir,
+        -: 1088:    //.releasedir = fs_releasedir,
+        -: 1089:    .mknod = fs_mknod,
+        -: 1090:    .mkdir = fs_mkdir,
+        -: 1091:    .unlink = fs_unlink,
+        -: 1092:    .rmdir = fs_rmdir,
+        -: 1093:    .rename = fs_rename,
+        -: 1094:    .chmod = fs_chmod,
+        -: 1095:    .utime = fs_utime,
+        -: 1096:    .truncate = fs_truncate,
+        -: 1097:    //.open = fs_open,
+        -: 1098:    .read = fs_read,
+        -: 1099:    .write = fs_write,
+        -: 1100:    //.release = fs_release,
+        -: 1101:    .statfs = fs_statfs,
+        -: 1102:};
+        -: 1103:
